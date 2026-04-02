@@ -1,0 +1,95 @@
+name: sql-debug-env
+version: 1.0.0
+description: >
+  SQL Debug & Data Pipeline Repair — an OpenEnv environment where an AI agent
+  diagnoses and fixes broken SQL queries and ETL pipelines executed against a
+  live DuckDB instance. Four tasks ranging from easy (syntax fix) to expert
+  (Window Functions). Features continuous dense reward shaping (Jaccard similarity) 
+  and AST-based anti-cheating penalties.
+
+author: sql-debug-env
+tags:
+  - openenv
+  - sql
+  - data-engineering
+  - debugging
+  - rl
+entrypoint: uvicorn app:app --host 0.0.0.0 --port 7860
+tasks:
+  - id: task1_syntax_fix
+    difficulty: easy
+    max_steps: 5
+    description: >
+      Fix a SQL query with a missing comma (syntax error) and a wrong table
+      alias in the WHERE clause. Three tables: orders, customers, products.
+    baseline_score: 1.0
+
+  - id: task2_join_aggregation
+    difficulty: medium
+    max_steps: 5
+    description: >
+      Fix a GROUP BY aggregation query that uses INNER JOINs, silently
+      dropping NULL-keyed rows and producing wrong revenue totals.
+    baseline_score: 1.0
+
+  - id: task3_etl_timezone
+    difficulty: hard
+    max_steps: 5
+    description: >
+      Trace and fix a 4-step ETL pipeline where Step 2 casts VARCHAR
+      timestamps with timezone offsets to DATE using implicit coercion,
+      stripping the offset. Fix must use TIMESTAMPTZ + AT TIME ZONE.
+    baseline_score: 0.40
+
+  - id: task4_expert_window
+    difficulty: expert
+    max_steps: 5
+    description: >
+      Calculate a 3-day rolling average of transaction amounts per user. 
+      Requires advanced window function mechanics (OVER PARTITION BY... ROWS BETWEEN).
+    baseline_score: 1.0
+
+observation_schema:
+  task_id: string
+  task_description: string
+  difficulty: "easy | medium | hard | expert"
+  broken_sql: "string | null  # null for Task 3"
+  pipeline_code: "string | null  # non-null for Task 3"
+  intermediate_outputs: "list | null  # wrong step outputs for Task 3"
+  schema_info: "dict[table_name, list[{column, type}]]"
+  step_number: integer
+  max_steps: integer
+  previous_attempts: "list[{step, fixed_sql, reward, info}]"
+  done: boolean
+  reward: "float | null"
+
+action_schema:
+  fixed_sql: string  # corrected SQL or full corrected pipeline code (Task 3)
+  explanation: "string | null  # root-cause explanation, scored for Task 3"
+
+reward_decomposition:
+  tasks_1_2_and_4:
+    parses: +0.10
+    executes: +0.20
+    column_accuracy: +0.10
+    data_accuracy: +0.30
+    exact_match_bonus: +0.30
+  task_3:
+    correct_step_identified: +0.15
+    step2_fixed: +0.25
+    step4_fixed: +0.20
+    final_totals_exact: +0.40
+  
+  penalties:
+    duplicate_submission: -0.10
+    efficiency_penalty: -0.20
+    destructive_action: -0.30
+    hardcode_penalty: -0.50
+
+endpoints:
+  health: GET /health
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+  tasks: GET /tasks
+  docs: GET /docs
