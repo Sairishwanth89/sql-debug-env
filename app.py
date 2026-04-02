@@ -1,8 +1,21 @@
 import json
+import time
+import duckdb
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# ── Global session state for DuckDB-backed tasks ──────────────────────────────
+CURRENT_SESSION = {
+    "task_id": None,
+    "con": None,           # duckdb.DuckDBPyConnection
+    "step_count": 0,
+    "done": False,
+    "baseline_rows": None, # for optimization task
+    "chaos_fixed": False,  # for chaos task
+    "reward_history": [],
+}
 
 app = FastAPI(
     title="SQL Debug RL Environment",
@@ -111,6 +124,104 @@ TASKS = {
         "error": "DataError: month must be in 1..12, got '13'.",
         "hint": "Change '2024-13-01' to a valid date like '2024-12-01'.",
     },
+
+    # ── Advanced Tasks ──────────────────────────────────────────────────────
+    "task_5_optimization": {
+        "label": "Task 5 — Advanced: Query Optimization",
+        "description": (
+            "A working query uses a CROSS JOIN + WHERE filter instead of a proper INNER JOIN. "
+            "It returns correct results but is catastrophically slow. "
+            "Your goal: rewrite it to use an explicit JOIN. "
+            "The verifier checks (1) output matches baseline and (2) EXPLAIN plan no longer contains CROSS_PRODUCT."
+        ),
+        "broken_sql": (
+            "SELECT c.name, SUM(o.amount) AS total_spent\n"
+            "FROM customers c, orders o\n"
+            "WHERE c.id = o.customer_id\n"
+            "GROUP BY c.name\n"
+            "ORDER BY total_spent DESC;"
+        ),
+        "schema_info": {
+            "customers": ["id INTEGER PRIMARY KEY", "name TEXT", "city TEXT"],
+            "orders": ["id INTEGER PRIMARY KEY", "customer_id INTEGER", "amount DECIMAL", "order_date DATE"],
+        },
+        "solution": (
+            "SELECT c.name, SUM(o.amount) AS total_spent\n"
+            "FROM customers c\n"
+            "INNER JOIN orders o ON c.id = o.customer_id\n"
+            "GROUP BY c.name\n"
+            "ORDER BY total_spent DESC;"
+        ),
+        "error": "Performance issue: CROSS JOIN creates a cartesian product before filtering. Zero errors, but terrible at scale.",
+        "hint": "Replace 'FROM customers c, orders o WHERE c.id = o.customer_id' with 'FROM customers c INNER JOIN orders o ON c.id = o.customer_id'.",
+        "duckdb_backed": True,
+    },
+    "task_6_migration": {
+        "label": "Task 6 — Advanced: Schema Migration (3NF)",
+        "description": (
+            "You have a single denormalized 'messy_dump' table with columns: "
+            "(user_id, user_name, order_id, order_date, product, amount). "
+            "Migrate it to a 3NF schema: users(id, name) and orders(id, user_id, order_date, product, amount). "
+            "Then DROP the original table. "
+            "WARNING: Dropping 'messy_dump' before populating target tables triggers a Destructive Action penalty and ends the episode."
+        ),
+        "broken_sql": (
+            "-- Step 1: Create target tables\n"
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n"
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, order_date DATE, product TEXT, amount DECIMAL);\n\n"
+            "-- Step 2: Migrate data\n"
+            "INSERT INTO users SELECT DISTINCT user_id, user_name FROM messy_dump;\n"
+            "INSERT INTO orders SELECT order_id, user_id, order_date::DATE, product, amount FROM messy_dump;\n\n"
+            "-- Step 3: Drop original\n"
+            "DROP TABLE messy_dump;"
+        ),
+        "schema_info": {
+            "messy_dump": ["user_id INTEGER", "user_name TEXT", "order_id INTEGER", "order_date TEXT", "product TEXT", "amount DECIMAL"],
+            "users [TARGET]": ["id INTEGER PRIMARY KEY", "name TEXT"],
+            "orders [TARGET]": ["id INTEGER PRIMARY KEY", "user_id INTEGER", "order_date DATE", "product TEXT", "amount DECIMAL"],
+        },
+        "solution": (
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n"
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, order_date DATE, product TEXT, amount DECIMAL);\n"
+            "INSERT INTO users SELECT DISTINCT user_id, user_name FROM messy_dump;\n"
+            "INSERT INTO orders SELECT order_id, user_id, order_date::DATE, product, amount FROM messy_dump;\n"
+            "DROP TABLE messy_dump;"
+        ),
+        "error": "NoError: Data exists but is denormalized. Goal is to normalize into 3NF and safely migrate.",
+        "hint": "Create 'users' and 'orders' tables first, INSERT data from messy_dump, then DROP messy_dump last.",
+        "duckdb_backed": True,
+    },
+    "task_7_chaos": {
+        "label": "Task 7 — Advanced: Chaos Engineering (Live Corruption)",
+        "description": (
+            "A live ETL pipeline runs on every step, inserting new records. "
+            "A bug is causing DUPLICATE user_id entries and NULL email values, "
+            "which poisons downstream analytics. "
+            "Query the 'error_logs' table to identify the root cause, "
+            "then apply a patch (UNIQUE constraint / COALESCE cleanup) to stop the corruption. "
+            "Reward increases for every clean step after your fix is applied."
+        ),
+        "broken_sql": (
+            "-- Inspect the error log first:\n"
+            "SELECT * FROM error_logs ORDER BY logged_at DESC LIMIT 10;\n\n"
+            "-- Then apply your fix. Example patches:\n"
+            "-- 1) Clean duplicates: DELETE FROM users WHERE rowid NOT IN (SELECT MIN(rowid) FROM users GROUP BY user_id);\n"
+            "-- 2) Fix NULLs: UPDATE users SET email = COALESCE(email, 'unknown@domain.com') WHERE email IS NULL;\n"
+            "-- 3) Add constraint: CREATE UNIQUE INDEX IF NOT EXISTS ux_users_id ON users(user_id);"
+        ),
+        "schema_info": {
+            "users": ["rowid INTEGER", "user_id INTEGER", "name TEXT", "email TEXT"],
+            "error_logs": ["id INTEGER", "error_type TEXT", "details TEXT", "logged_at TIMESTAMP"],
+        },
+        "solution": (
+            "DELETE FROM users WHERE rowid NOT IN (SELECT MIN(rowid) FROM users GROUP BY user_id);\n"
+            "UPDATE users SET email = COALESCE(email, 'unknown@domain.com') WHERE email IS NULL;\n"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_id ON users(user_id);"
+        ),
+        "error": "DataIntegrityError: Duplicate user_id values and NULL emails detected in the pipeline output.",
+        "hint": "First SELECT * FROM error_logs to understand what is failing, then clean duplicates and NULLs, and add a UNIQUE index.",
+        "duckdb_backed": True,
+    },
 }
 
 
@@ -124,10 +235,91 @@ def read_root():
 def health():
     return {"status": "ok", "version": "1.0.0", "message": "SQL Debug Environment is healthy."}
 
+def _seed_task5(con):
+    """Seed customers + orders for the optimization task."""
+    con.execute("DROP TABLE IF EXISTS customers; DROP TABLE IF EXISTS orders;")
+    con.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, city TEXT)")
+    con.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount DECIMAL, order_date DATE)")
+    customers = [(i, f"Customer_{i}", "City") for i in range(1, 51)]
+    orders = [(i, (i % 50) + 1, round(10 + (i * 3.7) % 500, 2), "2024-01-15") for i in range(1, 201)]
+    con.executemany("INSERT INTO customers VALUES (?, ?, ?)", customers)
+    con.executemany("INSERT INTO orders VALUES (?, ?, ?, ?)", orders)
+
+def _seed_task6(con):
+    """Seed messy_dump for the migration task."""
+    con.execute("DROP TABLE IF EXISTS messy_dump; DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS orders;")
+    con.execute("CREATE TABLE messy_dump (user_id INTEGER, user_name TEXT, order_id INTEGER, order_date TEXT, product TEXT, amount DECIMAL)")
+    rows = [
+        (1,"Alice",101,"2024-01-10","Widget A",29.99),
+        (1,"Alice",102,"2024-01-12","Widget B",49.99),
+        (2,"Bob",103,"2024-01-15","Gadget X",99.99),
+        (3,"Carol",104,"2024-01-20","Widget A",29.99),
+        (3,"Carol",105,"2024-01-22","Gadget Y",149.99),
+        (4,"Dave",106,"2024-02-01","Widget B",49.99),
+        (5,"Eve",107,"2024-02-05","Gadget X",99.99),
+    ]
+    con.executemany("INSERT INTO messy_dump VALUES (?,?,?,?,?,?)", rows)
+
+def _seed_task7(con):
+    """Seed a corrupted users table and an error_logs table for chaos task."""
+    con.execute("DROP SEQUENCE IF EXISTS seq_users; DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS error_logs;")
+    con.execute("CREATE SEQUENCE seq_users START 1")
+    con.execute("CREATE TABLE users (rowid INTEGER DEFAULT nextval('seq_users'), user_id INTEGER, name TEXT, email TEXT)")
+    con.execute("CREATE TABLE error_logs (id INTEGER, error_type TEXT, details TEXT, logged_at TIMESTAMP)")
+    users = [
+        (1,"Alice","alice@example.com"),
+        (2,"Bob","bob@example.com"),
+        (1,"Alice_dup",None),          # duplicate user_id + NULL email
+        (3,"Carol","carol@example.com"),
+        (4,"Dave",None),               # NULL email
+        (2,"Bob_dup","bob2@example.com"), # duplicate user_id
+    ]
+    con.executemany("INSERT INTO users (user_id, name, email) VALUES (?,?,?)", users)
+    logs = [
+        (1,"DUPLICATE_KEY","user_id=1 appears 2 times","2024-01-15 08:01:00"),
+        (2,"NULL_VIOLATION","email IS NULL for user_id=1 (row 3)","2024-01-15 08:01:01"),
+        (3,"DUPLICATE_KEY","user_id=2 appears 2 times","2024-01-15 08:01:02"),
+        (4,"NULL_VIOLATION","email IS NULL for user_id=4","2024-01-15 08:01:03"),
+    ]
+    con.executemany("INSERT INTO error_logs VALUES (?,?,?,?)", logs)
+
+def _run_chaos_pipeline(con):
+    """Simulate one ETL tick that tries to insert dirty data."""
+    import random, datetime
+    uid = random.randint(1, 3)  # intentional duplicate range
+    con.execute(
+        "INSERT INTO users (user_id, name, email) VALUES (?, ?, ?)",
+        [uid, f"Auto_{uid}", None if random.random() < 0.5 else f"auto{uid}@x.com"]
+    )
+
 @app.post("/reset", tags=["Environment"])
 def reset_episode(req: ResetRequest):
     task_id = req.task_id if req.task_id in TASKS else "task_1_easy"
     task = TASKS[task_id]
+
+    # Spin up a fresh DuckDB connection for DuckDB-backed tasks
+    if task.get("duckdb_backed"):
+        con = duckdb.connect(":memory:")
+        if task_id == "task_5_optimization":
+            _seed_task5(con)
+            baseline = con.execute(
+                "SELECT c.name, SUM(o.amount) AS total_spent "
+                "FROM customers c, orders o WHERE c.id = o.customer_id "
+                "GROUP BY c.name ORDER BY total_spent DESC"
+            ).fetchall()
+        elif task_id == "task_6_migration":
+            _seed_task6(con)
+            baseline = None
+        elif task_id == "task_7_chaos":
+            _seed_task7(con)
+            baseline = None
+
+        CURRENT_SESSION.update({
+            "task_id": task_id, "con": con, "step_count": 0,
+            "done": False, "baseline_rows": baseline,
+            "chaos_fixed": False, "reward_history": [],
+        })
+
     return {
         "status": "success",
         "observation": {
@@ -140,19 +332,145 @@ def reset_episode(req: ResetRequest):
         },
     }
 
+
 @app.post("/step", tags=["Environment"])
 def step_environment(action: StepAction):
-    sql = action.action.strip().upper()
-    solved = "GROUP BY" in sql or "," in sql or "PARTITION" in sql or "12-01" in sql
-    return {
-        "reward": 1.0 if solved else -0.1,
-        "done": solved,
-        "info": {
-            "message": "Execution succeeded." if solved else "Execution failed. Review your fix.",
-            "verifier": "DuckDB in-memory sandbox",
-        },
-        "state": {"current_sql": action.action, "step_count": 1},
-    }
+    task_id      = CURRENT_SESSION.get("task_id")
+    task         = TASKS.get(task_id, {})
+    con          = CURRENT_SESSION.get("con")
+    step_count   = CURRENT_SESSION.get("step_count", 0) + 1
+    CURRENT_SESSION["step_count"] = step_count
+
+    # ── Legacy tasks 1-4: simple pattern matching ───────────────────────────
+    if not task.get("duckdb_backed"):
+        sql    = action.action.strip().upper()
+        solved = "GROUP BY" in sql or "," in sql or "PARTITION" in sql or "12-01" in sql
+        reward = 1.0 if solved else -0.1
+        CURRENT_SESSION["reward_history"].append(reward)
+        return {
+            "reward": reward, "done": solved,
+            "info": {
+                "message": "Execution succeeded." if solved else "Execution failed. Review your fix.",
+                "verifier": "Pattern-match verifier",
+            },
+            "state": {"current_sql": action.action, "step_count": step_count},
+        }
+
+    # ── Task 5: Query Optimization ───────────────────────────────────────────
+    if task_id == "task_5_optimization":
+        agent_sql = action.action.strip()
+        reward, done, msg = 0.0, False, ""
+        try:
+            t0     = time.perf_counter()
+            rows   = con.execute(agent_sql).fetchall()
+            elapsed = time.perf_counter() - t0
+
+            baseline = CURRENT_SESSION["baseline_rows"]
+            correct  = sorted(rows) == sorted(baseline)
+            explain  = con.execute(f"EXPLAIN {agent_sql}").fetchall()
+            plan_str = " ".join(str(r) for r in explain).upper()
+            no_cross = "CROSS_PRODUCT" not in plan_str
+
+            if correct and no_cross:
+                reward, done = 1.0, True
+                msg = f"✅ Output matches baseline ({len(rows)} rows). EXPLAIN shows no CROSS_PRODUCT. Reward: +1.0"
+            elif correct:
+                reward = 0.5
+                msg = f"⚠️ Output matches baseline but EXPLAIN still shows CROSS_PRODUCT. Reward: +0.5"
+            else:
+                reward = -0.1
+                msg = "❌ Output does NOT match baseline. Check your query logic."
+        except Exception as e:
+            reward, msg = -0.2, f"❌ DuckDB Error: {e}"
+        CURRENT_SESSION["reward_history"].append(reward)
+        return {"reward": reward, "done": done,
+                "info": {"message": msg, "verifier": "DuckDB EXPLAIN + row comparison"},
+                "state": {"step_count": step_count}}
+
+    # ── Task 6: Schema Migration ─────────────────────────────────────────────
+    if task_id == "task_6_migration":
+        agent_sql = action.action.strip()
+        reward, done, msg = 0.0, False, ""
+        # Detect if agent is dropping messy_dump early (destructive action)
+        sql_upper = agent_sql.upper()
+        tables_before = {r[0].lower() for r in con.execute("SHOW TABLES").fetchall()}
+        users_ok   = "users"  in tables_before
+        orders_ok  = "orders" in tables_before
+        dropping   = "DROP" in sql_upper and "MESSY_DUMP" in sql_upper
+
+        if dropping and not (users_ok and orders_ok):
+            # Check if data is actually populated
+            u_ok = users_ok  and con.execute("SELECT COUNT(*) FROM users").fetchone()[0]  > 0
+            o_ok = orders_ok and con.execute("SELECT COUNT(*) FROM orders").fetchone()[0] > 0
+            if not (u_ok and o_ok):
+                reward, done = -0.3, True
+                msg = "💀 DESTRUCTIVE ACTION: Dropped messy_dump before fully populating target tables! Episode ended. Penalty: -0.3"
+                CURRENT_SESSION["done"] = True
+                CURRENT_SESSION["reward_history"].append(reward)
+                return {"reward": reward, "done": done,
+                        "info": {"message": msg, "verifier": "Intermediate-state guard"},
+                        "state": {"step_count": step_count}}
+        try:
+            for stmt in agent_sql.split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    con.execute(stmt)
+            tables_after = {r[0].lower() for r in con.execute("SHOW TABLES").fetchall()}
+            users_count  = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]  if "users"  in tables_after else 0
+            orders_count = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0] if "orders" in tables_after else 0
+            dump_gone    = "messy_dump" not in tables_after
+
+            if users_count >= 5 and orders_count >= 7 and dump_gone:
+                reward, done = 1.0, True
+                msg = f"✅ Migration complete! users={users_count} rows, orders={orders_count} rows. messy_dump dropped. Reward: +1.0"
+            elif users_count > 0 or orders_count > 0:
+                reward = 0.3
+                msg = f"🔄 Partial progress: users={users_count}, orders={orders_count}. messy_dump={'gone' if dump_gone else 'still exists'}."
+            else:
+                reward = 0.05
+                msg = "📋 Tables created. Now migrate the data with INSERT INTO ... SELECT."
+        except Exception as e:
+            reward, msg = -0.2, f"❌ DuckDB Error: {e}"
+        CURRENT_SESSION["reward_history"].append(reward)
+        return {"reward": reward, "done": done,
+                "info": {"message": msg, "verifier": "Row-count + table existence check"},
+                "state": {"step_count": step_count}}
+
+    # ── Task 7: Chaos Engineering ────────────────────────────────────────────
+    if task_id == "task_7_chaos":
+        agent_sql = action.action.strip()
+        reward, done, msg = 0.0, False, ""
+        try:
+            for stmt in agent_sql.split(";"):
+                stmt = stmt.strip()
+                if stmt and not stmt.startswith("--"):
+                    con.execute(stmt)
+            # Run one tick of the "live" ETL pipeline
+            _run_chaos_pipeline(con)
+            # Check integrity
+            dup_count  = con.execute("SELECT COUNT(*) FROM (SELECT user_id FROM users GROUP BY user_id HAVING COUNT(*)>1)").fetchone()[0]
+            null_count = con.execute("SELECT COUNT(*) FROM users WHERE email IS NULL").fetchone()[0]
+            has_index  = any("ux_users_id" in str(r) for r in con.execute("SELECT index_name FROM duckdb_indexes()").fetchall())
+
+            if dup_count == 0 and null_count == 0 and has_index:
+                reward, done = 1.0, True
+                CURRENT_SESSION["chaos_fixed"] = True
+                msg = "✅ Pipeline is clean! No duplicates, no NULLs, UNIQUE index in place. Reward: +1.0"
+            elif dup_count == 0 and null_count == 0:
+                reward = 0.7
+                msg = f"🔄 Data is clean this step but no UNIQUE index. Reward: +0.7 (add index to fully lock it in)"
+            elif CURRENT_SESSION.get("chaos_fixed"):
+                reward = 0.5
+                msg = f"⚠️ ETL re-introduced {dup_count} dups and {null_count} NULLs. Partial reward: +0.5"
+            else:
+                reward = -0.1
+                msg = f"❌ Still corrupt: {dup_count} duplicate user_ids, {null_count} NULL emails. Reward: -0.1"
+        except Exception as e:
+            reward, msg = -0.2, f"❌ DuckDB Error: {e}"
+        CURRENT_SESSION["reward_history"].append(reward)
+        return {"reward": reward, "done": done,
+                "info": {"message": msg, "verifier": "Integrity check (dups + NULLs + index)"},
+                "state": {"step_count": step_count}}
 
 @app.get("/state", tags=["Environment"])
 def get_state():
@@ -718,10 +1036,10 @@ async def web_ui():
 
   <!-- Stat Bar -->
   <div class="stat-bar">
-    <div class="stat"><div class="stat-val">4</div><div class="stat-lbl">Challenge Tasks</div></div>
+    <div class="stat"><div class="stat-val">7</div><div class="stat-lbl">Challenge Tasks</div></div>
     <div class="stat"><div class="stat-val">DuckDB</div><div class="stat-lbl">Sandbox Engine</div></div>
-    <div class="stat"><div class="stat-val">Dense</div><div class="stat-lbl">Reward Signal</div></div>
-    <div class="stat"><div class="stat-val">3</div><div class="stat-lbl">API Endpoints</div></div>
+    <div class="stat"><div class="stat-val">Live</div><div class="stat-lbl">Verifier</div></div>
+    <div class="stat"><div class="stat-val">3</div><div class="stat-lbl">Advanced RLVE</div></div>
   </div>
 
   <!-- Main -->
@@ -737,10 +1055,15 @@ async def web_ui():
           <div>
             <label class="field-label">🎯 Challenge Level</label>
             <select id="task-select">
-              <option value="task_1_easy">Task 1 — Easy: Syntax Fix</option>
+      <option value="task_1_easy">Task 1 — Easy: Syntax Fix</option>
               <option value="task_2_medium">Task 2 — Medium: GROUP BY</option>
               <option value="task_3_hard">Task 3 — Hard: Window Function</option>
               <option value="task_4_expert">Task 4 — Expert: CTE + Date</option>
+              <optgroup label="─── Advanced RLVE Tasks ───">
+              <option value="task_5_optimization">Task 5 — Optimization (EXPLAIN-verified)</option>
+              <option value="task_6_migration">Task 6 — Schema Migration (3NF)</option>
+              <option value="task_7_chaos">Task 7 — Chaos Engineering (Live DB)</option>
+              </optgroup>
             </select>
           </div>
           <button class="btn btn-primary" onclick="initEnv()">🔄 Initialize Environment</button>
@@ -825,10 +1148,27 @@ async def web_ui():
 
 <script>
 const TASKS = {TASKS_JSON};
+let currentTaskId = null;
+
+const ADVANCED_REWARDS = {{
+  task_5_optimization: [
+    ['Output matches baseline', '+0.50'],['No CROSS_PRODUCT in EXPLAIN', '+0.50'],
+    ['Wrong output', '-0.10'],['DuckDB error', '-0.20'],
+  ],
+  task_6_migration: [
+    ['Tables created', '+0.05'],['Data partially migrated', '+0.30'],
+    ['Full migration + DROP', '+1.00'],['Destructive early DROP', '-0.30'],['DuckDB error', '-0.20'],
+  ],
+  task_7_chaos: [
+    ['Zero dups + zero NULLs + UNIQUE index', '+1.00'],['Zero dups + zero NULLs (no index)', '+0.70'],
+    ['ETL still dirty', '-0.10'],['DuckDB error', '-0.20'],
+  ],
+}};
 
 function initEnv() {{
-  const taskId = document.getElementById('task-select').value;
-  const task = TASKS[taskId];
+  currentTaskId = document.getElementById('task-select').value;
+  const task = TASKS[currentTaskId];
+  const isAdvanced = !!task.duckdb_backed;
 
   document.getElementById('broken-code').value = task.broken_sql;
   document.getElementById('agent-input').value  = task.broken_sql;
@@ -842,77 +1182,73 @@ function initEnv() {{
   hintEl.textContent = '💡 Hint: ' + task.hint;
   hintEl.style.display = 'inline-block';
 
+  // Reward card
   const rewardBody = document.getElementById('reward-card-body');
   let rewardsHtml = '';
-
-  if (taskId === 'task_3_hard') {{
+  if (isAdvanced) {{
+    const entries = ADVANCED_REWARDS[currentTaskId] || [];
+    rewardsHtml = entries.map(([label, val]) => {{
+      const isPos = val.startsWith('+');
+      return `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <span style="font-size:13px;color:#e8e8f0">${{label}}</span>
+        <span style="font-family:var(--mono);color:${{isPos?'#34d399':'#f87171'}};font-weight:bold;font-size:13px;">${{val}}</span>
+      </div>`;
+    }}).join('');
+  }} else if (currentTaskId === 'task_3_hard') {{
     rewardsHtml = `
-      <div style="margin-bottom:12px;">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-          <span style="font-size:13px; color:#e8e8f0;">Correct Step Identified</span>
-          <span style="font-family:var(--mono); color:#34d399; font-weight:bold; font-size:13px;">+0.15</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-          <span style="font-size:13px; color:#e8e8f0;">Step 2 Fixed</span>
-          <span style="font-family:var(--mono); color:#34d399; font-weight:bold; font-size:13px;">+0.25</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-          <span style="font-size:13px; color:#e8e8f0;">Step 4 Fixed</span>
-          <span style="font-family:var(--mono); color:#34d399; font-weight:bold; font-size:13px;">+0.20</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <span style="font-size:13px; color:#e8e8f0;">Final Totals Exact Match</span>
-          <span style="font-family:var(--mono); color:#34d399; font-weight:bold; font-size:13px;">+0.40</span>
-        </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <span style="font-size:13px;color:#e8e8f0">Correct Step Identified</span>
+        <span style="font-family:var(--mono);color:#34d399;font-weight:bold;font-size:13px;">+0.15</span>
       </div>
-    `;
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <span style="font-size:13px;color:#e8e8f0">Step 2 Fixed</span>
+        <span style="font-family:var(--mono);color:#34d399;font-weight:bold;font-size:13px;">+0.25</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <span style="font-size:13px;color:#e8e8f0">Step 4 Fixed</span>
+        <span style="font-family:var(--mono);color:#34d399;font-weight:bold;font-size:13px;">+0.20</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:13px;color:#e8e8f0">Final Totals Exact Match</span>
+        <span style="font-family:var(--mono);color:#34d399;font-weight:bold;font-size:13px;">+0.40</span>
+      </div>`;
   }} else {{
     rewardsHtml = `
-      <div style="margin-bottom:12px;">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-          <span style="font-size:13px; color:#e8e8f0;">Parses successfully</span>
-          <span style="font-family:var(--mono); color:#34d399; font-weight:bold; font-size:13px;">+0.10</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-          <span style="font-size:13px; color:#e8e8f0;">Executes without error</span>
-          <span style="font-family:var(--mono); color:#34d399; font-weight:bold; font-size:13px;">+0.20</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-          <span style="font-size:13px; color:#e8e8f0;">Column Accuracy</span>
-          <span style="font-family:var(--mono); color:#34d399; font-weight:bold; font-size:13px;">+0.10</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-          <span style="font-size:13px; color:#e8e8f0;">Data Accuracy</span>
-          <span style="font-family:var(--mono); color:#34d399; font-weight:bold; font-size:13px;">+0.30</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <span style="font-size:13px; color:#e8e8f0;">Exact Match Bonus</span>
-          <span style="font-family:var(--mono); color:#34d399; font-weight:bold; font-size:13px;">+0.30</span>
-        </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <span style="font-size:13px;color:#e8e8f0">Parses successfully</span>
+        <span style="font-family:var(--mono);color:#34d399;font-weight:bold;font-size:13px;">+0.10</span>
       </div>
-    `;
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <span style="font-size:13px;color:#e8e8f0">Executes without error</span>
+        <span style="font-family:var(--mono);color:#34d399;font-weight:bold;font-size:13px;">+0.20</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <span style="font-size:13px;color:#e8e8f0">Column Accuracy</span>
+        <span style="font-family:var(--mono);color:#34d399;font-weight:bold;font-size:13px;">+0.10</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <span style="font-size:13px;color:#e8e8f0">Data Accuracy</span>
+        <span style="font-family:var(--mono);color:#34d399;font-weight:bold;font-size:13px;">+0.30</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:13px;color:#e8e8f0">Exact Match Bonus</span>
+        <span style="font-family:var(--mono);color:#34d399;font-weight:bold;font-size:13px;">+0.30</span>
+      </div>`;
   }}
-
   rewardsHtml += `
-    <div style="font-size:11px; font-weight:bold; color:var(--muted); text-transform:uppercase; margin-bottom:6px; margin-top: 10px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 10px;">Penalties</div>
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-      <span style="font-size:13px; color:var(--muted)">Duplicate Submission</span>
-      <span style="font-family:var(--mono); color:#f87171; font-weight:bold; font-size:13px;">-0.10</span>
+    <div style="font-size:11px;font-weight:bold;color:var(--muted);text-transform:uppercase;margin:10px 0 6px;border-top:1px solid rgba(255,255,255,0.05);padding-top:10px;">Penalties</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+      <span style="font-size:13px;color:var(--muted)">Duplicate Submission</span>
+      <span style="font-family:var(--mono);color:#f87171;font-weight:bold;font-size:13px;">-0.10</span>
     </div>
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-      <span style="font-size:13px; color:var(--muted)">Efficiency Penalty</span>
-      <span style="font-family:var(--mono); color:#f87171; font-weight:bold; font-size:13px;">-0.20</span>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+      <span style="font-size:13px;color:var(--muted)">Destructive Action</span>
+      <span style="font-family:var(--mono);color:#f87171;font-weight:bold;font-size:13px;">-0.30</span>
     </div>
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-      <span style="font-size:13px; color:var(--muted)">Destructive Action</span>
-      <span style="font-family:var(--mono); color:#f87171; font-weight:bold; font-size:13px;">-0.30</span>
-    </div>
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <span style="font-size:13px; color:var(--muted)">Hardcode Penalty</span>
-      <span style="font-family:var(--mono); color:#f87171; font-weight:bold; font-size:13px;">-0.50</span>
-    </div>
-  `;
-
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="font-size:13px;color:var(--muted)">Hardcode Penalty</span>
+      <span style="font-family:var(--mono);color:#f87171;font-weight:bold;font-size:13px;">-0.50</span>
+    </div>`;
   rewardBody.innerHTML = rewardsHtml;
 
   // Schema
@@ -923,16 +1259,26 @@ function initEnv() {{
     schemaStr += `}}\\n\\n`;
   }}
   document.getElementById('schema-dump').textContent = schemaStr.trim();
-
   document.getElementById('reward-card').style.display = 'block';
 
-  document.getElementById('verifier-out').className = 'verifier-output';
-  document.getElementById('verifier-out').innerHTML = '🔄 Environment initialized. Awaiting agent execution…';
+  // Call /reset on the server to seed the DuckDB environment
+  fetch('/reset', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{task_id: currentTaskId}})
+  }}).then(r => r.json()).then(data => {{
+    const out = document.getElementById('verifier-out');
+    out.className = 'verifier-output';
+    const badge = data.observation.label.includes('Advanced') || data.observation.label.includes('5')
+      || data.observation.label.includes('6') || data.observation.label.includes('7')
+      ? ' <span style="background:rgba(139,92,246,0.25);border:1px solid rgba(139,92,246,0.6);color:#c4b5fd;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:700;">🔬 DuckDB-Backed</span>' : '';
+    out.innerHTML = `🔄 Environment initialized.${{badge}} Awaiting agent execution…`;
+  }}).catch(() => {{
+    document.getElementById('verifier-out').innerHTML = '🔄 Environment initialized. Awaiting agent execution…';
+  }});
 }}
 
-function executeStep() {{
-  const taskId = document.getElementById('task-select').value;
-  const task = TASKS[taskId];
+async function executeStep() {{
   const agentSQL = document.getElementById('agent-input').value.trim();
   const out = document.getElementById('verifier-out');
 
@@ -941,32 +1287,69 @@ function executeStep() {{
     out.innerHTML = '<h3>⚠️ No Input</h3><p>Please write your SQL fix in the agent sandbox first.</p>';
     return;
   }}
-
-  // Fake verifier
-  const sql = agentSQL.toUpperCase();
-  const taskSolved = (
-    (taskId === 'task_1_easy'   && sql.includes(',') && sql.includes('NAME') && sql.includes('AGE')) ||
-    (taskId === 'task_2_medium' && sql.includes('GROUP BY')) ||
-    (taskId === 'task_3_hard'   && sql.includes('PARTITION BY')) ||
-    (taskId === 'task_4_expert' && !sql.includes('13-01') && sql.includes('MONTHLY_SALES'))
-  );
-
-  if (taskSolved) {{
-    out.className = 'verifier-output success';
-    out.innerHTML = `
-      <h3>✅ Verification Passed!</h3>
-      <p>The query compiled and executed successfully inside the DuckDB in-memory sandbox.</p>
-      <p>The pipeline produced the expected output rows without errors.</p>
-      <span class="reward-pill reward-positive">Reward: +1.0</span>
-    `;
-  }} else {{
+  if (!currentTaskId) {{
     out.className = 'verifier-output error';
-    out.innerHTML = `
-      <h3>❌ Verification Failed</h3>
-      <p>DuckDB raised an error during execution.</p>
-      <p style="font-family:var(--mono);font-size:12px;margin-top:6px;opacity:0.8">${{task.error}}</p>
-      <span class="reward-pill reward-negative">Reward: -0.1</span>
-    `;
+    out.innerHTML = '<h3>⚠️ No Task Loaded</h3><p>Click Initialize Environment first.</p>';
+    return;
+  }}
+
+  out.className = 'verifier-output';
+  out.innerHTML = '⏳ Executing in DuckDB sandbox…';
+
+  const task = TASKS[currentTaskId];
+  const isAdvanced = !!task.duckdb_backed;
+
+  if (isAdvanced) {{
+    // Real API call for DuckDB-backed tasks
+    try {{
+      const res = await fetch('/step', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{action: agentSQL, explanation: ''}})
+      }});
+      const data = await res.json();
+      const reward = data.reward;
+      const done   = data.done;
+      const msg    = data.info?.message || '';
+      const verifier = data.info?.verifier || 'DuckDB';
+      const isPos  = reward >= 0;
+      out.className = `verifier-output ${{done && reward > 0 ? 'success' : reward < 0 ? 'error' : 'success'}}`;
+      out.innerHTML = `
+        <h3>${{done && reward >= 1.0 ? '✅' : reward < 0 ? '❌' : '⚠️'}} Verifier Result</h3>
+        <p style="margin-top:6px">${{msg}}</p>
+        <p style="margin-top:8px;font-size:11px;color:var(--muted)">🔬 ${{verifier}} · Step ${{data.state?.step_count ?? '?'}}</p>
+        <span class="reward-pill ${{isPos ? 'reward-positive' : 'reward-negative'}}">Reward: ${{reward >= 0 ? '+' : ''}}${{reward.toFixed(2)}}</span>
+      `;
+    }} catch(e) {{
+      out.className = 'verifier-output error';
+      out.innerHTML = `<h3>❌ Network Error</h3><p>${{e.message}}</p>`;
+    }}
+  }} else {{
+    // Client-side pattern-match verifier for legacy tasks 1-4
+    const sql = agentSQL.toUpperCase();
+    const taskSolved = (
+      (currentTaskId === 'task_1_easy'   && sql.includes(',') && sql.includes('NAME') && sql.includes('AGE')) ||
+      (currentTaskId === 'task_2_medium' && sql.includes('GROUP BY')) ||
+      (currentTaskId === 'task_3_hard'   && sql.includes('PARTITION BY')) ||
+      (currentTaskId === 'task_4_expert' && !sql.includes('13-01') && sql.includes('MONTHLY_SALES'))
+    );
+    if (taskSolved) {{
+      out.className = 'verifier-output success';
+      out.innerHTML = `
+        <h3>✅ Verification Passed!</h3>
+        <p>The query compiled and executed successfully inside the DuckDB in-memory sandbox.</p>
+        <p>The pipeline produced the expected output rows without errors.</p>
+        <span class="reward-pill reward-positive">Reward: +1.0</span>
+      `;
+    }} else {{
+      out.className = 'verifier-output error';
+      out.innerHTML = `
+        <h3>❌ Verification Failed</h3>
+        <p>DuckDB raised an error during execution.</p>
+        <p style="font-family:var(--mono);font-size:12px;margin-top:6px;opacity:0.8">${{task.error}}</p>
+        <span class="reward-pill reward-negative">Reward: -0.1</span>
+      `;
+    }}
   }}
 }}
 </script>
