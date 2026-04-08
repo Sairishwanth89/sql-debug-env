@@ -321,6 +321,13 @@ def reset_episode(req: ResetRequest = None):
             "done": False, "baseline_rows": baseline,
             "chaos_fixed": False, "reward_history": [],
         })
+    else:
+        # Non-duckdb tasks also need session tracking
+        CURRENT_SESSION.update({
+            "task_id": task_id, "con": None, "step_count": 0,
+            "done": False, "baseline_rows": None,
+            "chaos_fixed": False, "reward_history": [],
+        })
 
     return {
         "status": "success",
@@ -476,12 +483,14 @@ def step_environment(action: StepAction):
 
 @app.get("/state", tags=["Environment"])
 def get_state():
+    task_id = CURRENT_SESSION.get("task_id", "task_1_easy")
+    task = TASKS.get(task_id, TASKS["task_1_easy"])
     return {
-        "task_id": "task_2_medium",
-        "current_sql": TASKS["task_2_medium"]["broken_sql"],
-        "step_count": 0,
-        "done": False,
-        "schema": TASKS["task_2_medium"]["schema_info"],
+        "task_id": task_id,
+        "current_sql": task["broken_sql"],
+        "step_count": CURRENT_SESSION.get("step_count", 0),
+        "done": CURRENT_SESSION.get("done", False),
+        "schema": task["schema_info"],
     }
 
 @app.get("/tasks", tags=["System"])

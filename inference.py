@@ -130,10 +130,8 @@ Return ONLY the fixed SQL. No explanation."""
             # Handle rate limits (429) manually with backoff
             if "429" in str(e) and attempt < 3:
                 wait = 4 * (2 ** attempt)
-                print(f"[DEBUG] Rate limited, retrying in {wait}s...", flush=True)
                 time.sleep(wait)
                 continue
-            print(f"[DEBUG] LLM call failed: {e}", flush=True)
             return broken_sql
     return broken_sql
 
@@ -189,7 +187,6 @@ def run_task(task_id: str) -> float:
         success = score >= 0.5
 
     except Exception as exc:
-        print(f"[DEBUG] Task {task_id} error: {exc}", flush=True)
         score = 0.15   # Non-zero safe default
         success = False
 
@@ -222,15 +219,13 @@ def main():
         
         avg = sum(all_scores) / len(all_scores)
         final_data["avg_score"] = avg
-        print(f"[SUMMARY] tasks={len(ALL_TASKS)} avg_score={avg:.4f}", flush=True)
 
     # Save to JSON for local tracking
     try:
         with open(results_path, "w") as f:
             json.dump(final_data, f, indent=2)
-        print(f"[DEBUG] Results saved to {results_path}", flush=True)
     except Exception as e:
-        print(f"[DEBUG] Could not save progress to JSON: {e}", flush=True)
+        pass
 
 
 if __name__ == "__main__":

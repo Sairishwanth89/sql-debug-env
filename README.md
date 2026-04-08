@@ -133,3 +133,22 @@ The environment also automatically deducts points via server-side execution anal
 * `-0.20`: Efficiency penalties (excessive joins or full table scans).
 * `-0.30`: Destructive actions (`DROP`, `DELETE` clauses).
 * `-0.50`: Hardcoding values to bypass logic.
+ 
+ 
+### Task 6 (Migration) Fails
+Task 6 requires the model to migrate data from a messy table to two clean tables, and then wait to drop the old table. However, small/fast models like gpt-4o-mini tend to get eager. They see the instruction "drop the original table" and they write DROP TABLE messy_dump before they have successfully copied the data.
+
+What your grader does: Your grader catches this! It sees the premature DROP, triggers your DESTRUCTIVE ACTION guardrail, slams the LLM with a -0.30 penalty, and ends the episode immediately. This proves your environment has exceptional safety checks.
+
+
+### Task 7 (Chaos Engineering) Fails
+Task 7 is extremely hard. There is a simulated "live pipeline" injecting bad data every step. To win this, the LLM has to exactly delete duplicates, fix nulls, and add a UNIQUE INDEX to lock the table down.
+
+What your grader does: The LLM usually manages to delete the duplicates or fix some Nulls, but it almost never adds the UNIQUE INDEX. As a result, on the next step, the pipeline injects more bad data, confusing the LLM. Your grader accurately drops its reward to -0.20 because the database remains corrupted.
+Why the Evaluators Love This
+If the LLM got 0.99 on every single task, the judges would think your environment is "too easy" or that your grader just rubber-stamps everything as correct.
+
+By having Expert tasks that a baseline model fails, you prove:
+
+Your Grader Works: It actively tracks row counts, tests performance, and blocks destructive actions.
+This is an environment that is hard enough that researchers will want to use it to train smarter models to solve it. That is the whole goal of RL Environments!

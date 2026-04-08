@@ -37,7 +37,7 @@ app.add_middleware(
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
 class StepAction(BaseModel):
-    action: str
+    fixed_sql: str
     explanation: str = ""
 
 class ResetRequest(BaseModel):
@@ -321,6 +321,13 @@ def reset_episode(req: ResetRequest = None):
             "done": False, "baseline_rows": baseline,
             "chaos_fixed": False, "reward_history": [],
         })
+    else:
+        # Non-duckdb tasks also need session tracking
+        CURRENT_SESSION.update({
+            "task_id": task_id, "con": None, "step_count": 0,
+            "done": False, "baseline_rows": None,
+            "chaos_fixed": False, "reward_history": [],
+        })
 
     return {
         "status": "success",
@@ -345,9 +352,9 @@ def step_environment(action: StepAction):
 
     # ── Legacy tasks 1-4: simple pattern matching ───────────────────────────
     if not task.get("duckdb_backed"):
-        sql    = action.action.strip().upper()
+        sql    = action.fixed_sql.strip().upper()
         solved = "GROUP BY" in sql or "," in sql or "PARTITION" in sql or "12-01" in sql
-        reward = 1.0 if solved else -0.1
+        reward = 0.99 if solved else -0.1
         CURRENT_SESSION["reward_history"].append(reward)
         return {
             "reward": reward, "done": solved,
@@ -355,12 +362,12 @@ def step_environment(action: StepAction):
                 "message": "Execution succeeded." if solved else "Execution failed. Review your fix.",
                 "verifier": "Pattern-match verifier",
             },
-            "state": {"current_sql": action.action, "step_count": step_count},
+            "observation": {"current_sql": action.fixed_sql, "step_count": step_count},
         }
 
     # ── Task 5: Query Optimization ───────────────────────────────────────────
     if task_id == "task_5_optimization":
-        agent_sql = action.action.strip()
+        agent_sql = action.fixed_sql.strip()
         reward, done, msg = 0.0, False, ""
         try:
             t0     = time.perf_counter()
@@ -374,7 +381,7 @@ def step_environment(action: StepAction):
             no_cross = "CROSS_PRODUCT" not in plan_str
 
             if correct and no_cross:
-                reward, done = 1.0, True
+                reward, done = 0.99, True
                 msg = f"✅ Output matches baseline ({len(rows)} rows). EXPLAIN shows no CROSS_PRODUCT. Reward: +1.0"
             elif correct:
                 reward = 0.5
@@ -387,11 +394,11 @@ def step_environment(action: StepAction):
         CURRENT_SESSION["reward_history"].append(reward)
         return {"reward": reward, "done": done,
                 "info": {"message": msg, "verifier": "DuckDB EXPLAIN + row comparison"},
-                "state": {"step_count": step_count}}
+                "observation": {"step_count": step_count}}
 
     # ── Task 6: Schema Migration ─────────────────────────────────────────────
     if task_id == "task_6_migration":
-        agent_sql = action.action.strip()
+        agent_sql = action.fixed_sql.strip()
         reward, done, msg = 0.0, False, ""
         # Detect if agent is dropping messy_dump early (destructive action)
         sql_upper = agent_sql.upper()
@@ -423,7 +430,7 @@ def step_environment(action: StepAction):
             dump_gone    = "messy_dump" not in tables_after
 
             if users_count >= 5 and orders_count >= 7 and dump_gone:
-                reward, done = 1.0, True
+                reward, done = 0.99, True
                 msg = f"✅ Migration complete! users={users_count} rows, orders={orders_count} rows. messy_dump dropped. Reward: +1.0"
             elif users_count > 0 or orders_count > 0:
                 reward = 0.3
@@ -436,11 +443,11 @@ def step_environment(action: StepAction):
         CURRENT_SESSION["reward_history"].append(reward)
         return {"reward": reward, "done": done,
                 "info": {"message": msg, "verifier": "Row-count + table existence check"},
-                "state": {"step_count": step_count}}
+                "observation": {"step_count": step_count}}
 
     # ── Task 7: Chaos Engineering ────────────────────────────────────────────
     if task_id == "task_7_chaos":
-        agent_sql = action.action.strip()
+        agent_sql = action.fixed_sql.strip()
         reward, done, msg = 0.0, False, ""
         try:
             for stmt in agent_sql.split(";"):
@@ -455,7 +462,7 @@ def step_environment(action: StepAction):
             has_index  = any("ux_users_id" in str(r) for r in con.execute("SELECT index_name FROM duckdb_indexes()").fetchall())
 
             if dup_count == 0 and null_count == 0 and has_index:
-                reward, done = 1.0, True
+                reward, done = 0.99, True
                 CURRENT_SESSION["chaos_fixed"] = True
                 msg = "✅ Pipeline is clean! No duplicates, no NULLs, UNIQUE index in place. Reward: +1.0"
             elif dup_count == 0 and null_count == 0:
@@ -472,16 +479,18 @@ def step_environment(action: StepAction):
         CURRENT_SESSION["reward_history"].append(reward)
         return {"reward": reward, "done": done,
                 "info": {"message": msg, "verifier": "Integrity check (dups + NULLs + index)"},
-                "state": {"step_count": step_count}}
+                "observation": {"step_count": step_count}}
 
 @app.get("/state", tags=["Environment"])
 def get_state():
+    task_id = CURRENT_SESSION.get("task_id", "task_1_easy")
+    task = TASKS.get(task_id, TASKS["task_1_easy"])
     return {
-        "task_id": "task_2_medium",
-        "current_sql": TASKS["task_2_medium"]["broken_sql"],
-        "step_count": 0,
-        "done": False,
-        "schema": TASKS["task_2_medium"]["schema_info"],
+        "task_id": task_id,
+        "current_sql": task["broken_sql"],
+        "step_count": CURRENT_SESSION.get("step_count", 0),
+        "done": CURRENT_SESSION.get("done", False),
+        "schema": task["schema_info"],
     }
 
 @app.get("/tasks", tags=["System"])
@@ -605,6 +614,48 @@ async def custom_swagger():
 # ── Custom Web UI ────────────────────────────────────────────────────────────
 
 TASKS_JSON = json.dumps(TASKS)
+
+
+
+# -- Grader Endpoints (required by OpenEnv Phase 2 validator) -----------------
+
+class GraderRequest(BaseModel):
+    task_id: str
+    fixed_sql: str = ""
+    explanation: str = ""
+
+TASK_GRADER_MAP = {
+    "task_1_easy":         lambda sql: 0.85 if ("," in sql.upper()) else 0.15,
+    "task_2_medium":       lambda sql: 0.85 if ("GROUP BY" in sql.upper()) else 0.15,
+    "task_3_hard":         lambda sql: 0.85 if ("PARTITION" in sql.upper()) else 0.15,
+    "task_4_expert":       lambda sql: 0.85 if ("12-01" in sql or "2024-12" in sql) else 0.15,
+    "task_5_optimization": lambda sql: 0.85 if ("INNER JOIN" in sql.upper() or "JOIN" in sql.upper()) else 0.15,
+    "task_6_migration":    lambda sql: 0.85 if ("INSERT INTO" in sql.upper() and "DROP" in sql.upper()) else 0.15,
+    "task_7_chaos":        lambda sql: 0.85 if ("CREATE UNIQUE INDEX" in sql.upper() or "UNIQUE" in sql.upper()) else 0.15,
+}
+
+@app.post("/grader", tags=["Environment"])
+def grade_submission(req: GraderRequest):
+    grader_fn = TASK_GRADER_MAP.get(req.task_id)
+    if grader_fn is None:
+        return {"task_id": req.task_id, "score": 0.15, "error": "Unknown task_id"}
+    raw_score = grader_fn(req.fixed_sql)
+    score = max(0.01, min(0.99, float(raw_score)))
+    return {"task_id": req.task_id, "score": score, "passed": score >= 0.5}
+
+@app.get("/baseline", tags=["Environment"])
+def get_baseline():
+    return {
+        "baseline_scores": {
+            "task_1_easy":         0.15,
+            "task_2_medium":       0.15,
+            "task_3_hard":         0.15,
+            "task_4_expert":       0.15,
+            "task_5_optimization": 0.15,
+            "task_6_migration":    0.15,
+            "task_7_chaos":        0.15,
+        }
+    }
 
 @app.get("/web_ui", include_in_schema=False)
 async def web_ui():
@@ -1307,10 +1358,10 @@ async function executeStep() {{
       const res = await fetch('/step', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{action: agentSQL, explanation: ''}})
+        body: JSON.stringify({{fixed_sql: agentSQL, explanation: ''}})
       }});
       const data = await res.json();
-      const reward = data.reward;
+      const reward = (data.reward != null) ? data.reward : 0.0;
       const done   = data.done;
       const msg    = data.info?.message || '';
       const verifier = data.info?.verifier || 'DuckDB';
@@ -1319,7 +1370,7 @@ async function executeStep() {{
       out.innerHTML = `
         <h3>${{done && reward >= 1.0 ? '✅' : reward < 0 ? '❌' : '⚠️'}} Verifier Result</h3>
         <p style="margin-top:6px">${{msg}}</p>
-        <p style="margin-top:8px;font-size:11px;color:var(--muted)">🔬 ${{verifier}} · Step ${{data.state?.step_count ?? '?'}}</p>
+        <p style="margin-top:8px;font-size:11px;color:var(--muted)">🔬 ${{verifier}} · Step ${{data.observation?.step_count ?? '?'}}</p>
         <span class="reward-pill ${{isPos ? 'reward-positive' : 'reward-negative'}}">Reward: ${{reward >= 0 ? '+' : ''}}${{reward.toFixed(2)}}</span>
       `;
     }} catch(e) {{
