@@ -3,9 +3,8 @@ version: 1.0.0
 description: >
   SQL Debug & Data Pipeline Repair — an OpenEnv environment where an AI agent
   diagnoses and fixes broken SQL queries and ETL pipelines executed against a
-  live DuckDB instance. Four tasks ranging from easy (syntax fix) to expert
-  (Window Functions). Features continuous dense reward shaping (Jaccard similarity) 
-  and AST-based anti-cheating penalties.
+  live DuckDB instance. Seven tasks ranging from easy (syntax fix) to expert
+  (chaos engineering).
 
 author: sql-debug-env
 tags:
@@ -15,76 +14,82 @@ tags:
   - debugging
   - rl
 entrypoint: uvicorn app:app --host 0.0.0.0 --port 7860
+inference: python inference.py
+
 tasks:
-  - id: task1_syntax_fix
+  - id: task_1_easy
     difficulty: easy
     max_steps: 5
     description: >
-      Fix a SQL query with a missing comma (syntax error) and a wrong table
-      alias in the WHERE clause. Three tables: orders, customers, products.
-    baseline_score: 1.0
+      Fix a SQL SELECT query with a missing comma between column names.
+    grader: SQLGrader
+    grading_metric: accuracy
+    baseline_score: 0.5
 
-  - id: task2_join_aggregation
+  - id: task_2_medium
     difficulty: medium
     max_steps: 5
     description: >
-      Fix a GROUP BY aggregation query that uses INNER JOINs, silently
-      dropping NULL-keyed rows and producing wrong revenue totals.
-    baseline_score: 1.0
+      Fix a GROUP BY aggregation query — add GROUP BY clause.
+    grader: SQLGrader
+    grading_metric: accuracy
+    baseline_score: 0.5
 
-  - id: task3_etl_timezone
+  - id: task_3_hard
     difficulty: hard
     max_steps: 5
     description: >
-      Trace and fix a 4-step ETL pipeline where Step 2 casts VARCHAR
-      timestamps with timezone offsets to DATE using implicit coercion,
-      stripping the offset. Fix must use TIMESTAMPTZ + AT TIME ZONE.
-    baseline_score: 0.40
+      Fix a RANK() window function missing PARTITION BY department.
+    grader: SQLGrader
+    grading_metric: accuracy
+    baseline_score: 0.5
 
-  - id: task4_expert_window
+  - id: task_4_expert
     difficulty: expert
     max_steps: 5
     description: >
-      Calculate a 3-day rolling average of transaction amounts per user. 
-      Requires advanced window function mechanics (OVER PARTITION BY... ROWS BETWEEN).
-    baseline_score: 1.0
+      Fix an invalid date literal (month 13) inside a CTE.
+    grader: SQLGrader
+    grading_metric: accuracy
+    baseline_score: 0.5
+
+  - id: task_5_optimization
+    difficulty: expert
+    max_steps: 5
+    description: >
+      Rewrite a CROSS JOIN query to use INNER JOIN.
+    grader: SQLGrader
+    grading_metric: accuracy
+    baseline_score: 0.5
+
+  - id: task_6_migration
+    difficulty: expert
+    max_steps: 5
+    description: >
+      Migrate denormalized table to 3NF schema safely.
+    grader: SQLGrader
+    grading_metric: accuracy
+    baseline_score: 0.5
+
+  - id: task_7_chaos
+    difficulty: expert
+    max_steps: 5
+    description: >
+      Fix a live ETL pipeline with duplicate entries and NULL emails.
+    grader: SQLGrader
+    grading_metric: accuracy
+    baseline_score: 0.5
 
 observation_schema:
   task_id: string
-  task_description: string
-  difficulty: "easy | medium | hard | expert"
-  broken_sql: "string | null  # null for Task 3"
-  pipeline_code: "string | null  # non-null for Task 3"
-  intermediate_outputs: "list | null  # wrong step outputs for Task 3"
-  schema_info: "dict[table_name, list[{column, type}]]"
-  step_number: integer
-  max_steps: integer
-  previous_attempts: "list[{step, fixed_sql, reward, info}]"
-  done: boolean
-  reward: "float | null"
+  description: string
+  broken_sql: string
+  schema_info: object
+  error_hint: string
 
 action_schema:
-  fixed_sql: string  # corrected SQL or full corrected pipeline code (Task 3)
-  explanation: "string | null  # root-cause explanation, scored for Task 3"
-
-reward_decomposition:
-  tasks_1_2_and_4:
-    parses: +0.10
-    executes: +0.20
-    column_accuracy: +0.10
-    data_accuracy: +0.30
-    exact_match_bonus: +0.30
-  task_3:
-    correct_step_identified: +0.15
-    step2_fixed: +0.25
-    step4_fixed: +0.20
-    final_totals_exact: +0.40
-  
-  penalties:
-    duplicate_submission: -0.10
-    efficiency_penalty: -0.20
-    destructive_action: -0.30
-    hardcode_penalty: -0.50
+  fixed_sql: string
+  explanation: string
 
 endpoints:
   health: GET /health
@@ -92,4 +97,6 @@ endpoints:
   step: POST /step
   state: GET /state
   tasks: GET /tasks
+  grader: POST /grader
+  baseline: GET /baseline
   docs: GET /docs
